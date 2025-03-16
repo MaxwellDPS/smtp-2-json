@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  smtp-json-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: smtp-json-server:latest
+    container_name: smtp-json-server
+    ports:
+      - "8025:8025"
+    volumes:
+      - ./emails:/app/emails
+    environment:
+      - TZ=UTC
+    restart: unless-stopped
+    command: ["--host", "0.0.0.0", "--port", "8025", "--output-dir", "/app/emails", "--stdout"]
