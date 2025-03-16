@@ -43,7 +43,7 @@ const server = new SMTPServer({
     const clientInfo = `[${session.remoteAddress}:${session.remotePort}]`;
     console.log(`${new Date().toISOString()} - Auth attempt from ${clientInfo} user=${auth.username}`);
     callback(new Error('Authentication disabled'));
-  }
+  },
   
   // Log mail from events
   onMailFrom(address, session, callback) {
