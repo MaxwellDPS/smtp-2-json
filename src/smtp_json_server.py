@@ -22,7 +22,7 @@ from pathlib import Path
 from aiosmtpd.controller import Controller
 from aiosmtpd.handlers import Message
 
-import requests  # For webhook functionality
+import aiohttp  # Replacing requests with async HTTP client
 from dotenv import load_dotenv  # For environment variable support
 
 logging.basicConfig(
@@ -41,6 +41,7 @@ class EmailToJSONHandler(Message):
             webhook_url: URL to POST JSON data
         """
         self.webhook_url = webhook_url
+        self.session = None  # Will initialize in handle_message
         
         super().__init__()
     
@@ -52,10 +53,14 @@ class EmailToJSONHandler(Message):
             logger.info("Received email: %s", message.get('subject', 'No Subject'))
             
             try:
-                # Increase timeout for webhook requests with large attachments
+                # Ensure we have an aiohttp session
+                if self.session is None or self.session.closed:
+                    self.session = aiohttp.ClientSession()
+                
+                # Convert email to JSON
                 email_json = self.email_to_json(message)
                 
-                # Handle the JSON according to configured outputs
+                # Send to webhook
                 await self._handle_json_output(email_json)
                 
                 return '250 Message accepted for processing'
@@ -249,8 +254,12 @@ class EmailToJSONHandler(Message):
             })
     
     async def _handle_json_output(self, email_json):
-        """Post the JSON to the configured webhook URL"""
+        """Post the JSON to the configured webhook URL using aiohttp"""
         try:
+            # Ensure we have an aiohttp session
+            if self.session is None or self.session.closed:
+                self.session = aiohttp.ClientSession()
+            
             headers = {
                 'Content-Type': 'application/json',
                 'User-Agent': 'SMTP-JSON-Server/1.0'
@@ -266,27 +275,29 @@ class EmailToJSONHandler(Message):
             logger.info(f"Total attachment size: {total_size} bytes")
             
             # For extremely large emails, increase timeout or chunk them 
-            timeout = 30 if total_size > 50 * 1024 * 1024 else 10  # 30 seconds for >50MB
+            timeout = aiohttp.ClientTimeout(total=30 if total_size > 50 * 1024 * 1024 else 10)  # 30 seconds for >50MB
             
             # Make the POST request with appropriate timeout
-            response = requests.post(
+            async with self.session.post(
                 self.webhook_url,
                 json=email_json,
                 headers=headers,
-                timeout=timeout
-            )
+                timeout=timeout,
+                raise_for_status=False  # Handle errors manually
+            ) as response:
+                status_code = response.status
+                logger.info(f"Webhook response: {status_code}")
+                
+                if status_code >= 400:
+                    error_text = await response.text()
+                    logger.error(f"Webhook error: {error_text}")
+                
+                return status_code < 400  # Return success status
             
-            logger.info(f"Webhook response: {response.status_code}")
-            
-            if response.status_code >= 400:
-                logger.error(f"Webhook error: {response.text}")
-            
-            return response.status_code < 400  # Return success status
-            
-        except requests.exceptions.Timeout:
+        except asyncio.TimeoutError:
             logger.error(f"Webhook timeout - request took too long")
             return False
-        except requests.exceptions.ConnectionError as e:
+        except aiohttp.ClientConnectorError as e:
             logger.error(f"Webhook connection error: {e}")
             return False
         except Exception as e:
@@ -345,7 +356,13 @@ async def amain(host, port, webhook_url):
     except KeyboardInterrupt:
         logger.info("Server shutdown requested")
     finally:
+        # Cleanup
         controller.stop()
+        
+        # Close the aiohttp session if it exists
+        if hasattr(handler, 'session') and handler.session and not handler.session.closed:
+            await handler.session.close()
+            
         logger.info("SMTP server stopped")
 
 
