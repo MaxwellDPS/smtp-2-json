@@ -9,7 +9,7 @@ from typing import Dict, List, Any, Optional
 
 import aiohttp
 from aiosmtpd.controller import Controller
-from aiosmtpd.handlers import AsyncMessage
+from aiosmtpd.smtp import SMTP, Session, Envelope
 
 # Configure logging
 logging.basicConfig(
@@ -18,24 +18,24 @@ logging.basicConfig(
 )
 logger = logging.getLogger('smtp-webhook')
 
-class WebhookHandler(AsyncMessage):
+class WebhookHandler:
     """
     SMTP Handler that forwards messages as JSON to a webhook URL
     """
     def __init__(self, webhook_url: str):
-        super().__init__()
         self.webhook_url = webhook_url
         logger.info(f"Webhook URL configured: {webhook_url}")
 
-    async def handle_message(self, message):
+    async def handle_DATA(self, server, session, envelope):
         """Process the email message and forward it to the webhook"""
         try:
-            # Parse the email message if it's bytes
-            if isinstance(message, bytes):
-                message = email.message_from_bytes(message, policy=default)
+            # Extract the message data
+            message_data = envelope.content
+            # Parse the email message
+            message = email.message_from_bytes(message_data, policy=default)
             
             # Extract email data
-            email_data = await self._extract_email_data(message)
+            email_data = await self._extract_email_data(message, envelope)
             
             # Send to webhook
             await self._send_webhook(email_data)
@@ -45,14 +45,12 @@ class WebhookHandler(AsyncMessage):
             logger.error(f"Error handling message: {str(e)}", exc_info=True)
             return '500 Error processing message'
 
-    async def _extract_email_data(self, message) -> Dict[str, Any]:
+    async def _extract_email_data(self, message, envelope) -> Dict[str, Any]:
         """Extract all relevant data from the email message"""
         # Get basic headers
         email_data = {
-            "from": message.get("From", ""),
-            "to": message.get("To", ""),
-            "cc": message.get("Cc", ""),
-            "bcc": message.get("Bcc", ""),
+            "from": envelope.mail_from,
+            "to": envelope.rcpt_tos,
             "subject": message.get("Subject", ""),
             "date": message.get("Date", ""),
             "message_id": message.get("Message-ID", ""),
@@ -72,9 +70,21 @@ class WebhookHandler(AsyncMessage):
             # Extract body parts
             if content_disposition is None:
                 if content_type == "text/plain":
-                    email_data["body"]["plain"] = part.get_content()
+                    try:
+                        email_data["body"]["plain"] = part.get_content()
+                    except:
+                        # Fallback for older email formats
+                        payload = part.get_payload(decode=True)
+                        if payload:
+                            email_data["body"]["plain"] = payload.decode('utf-8', errors='replace')
                 elif content_type == "text/html":
-                    email_data["body"]["html"] = part.get_content()
+                    try:
+                        email_data["body"]["html"] = part.get_content()
+                    except:
+                        # Fallback for older email formats
+                        payload = part.get_payload(decode=True)
+                        if payload:
+                            email_data["body"]["html"] = payload.decode('utf-8', errors='replace')
             
             # Extract attachments
             elif content_disposition == "attachment":
@@ -82,13 +92,14 @@ class WebhookHandler(AsyncMessage):
                 if filename:
                     # Get payload and encode to base64
                     payload = part.get_payload(decode=True)
-                    encoded_payload = base64.b64encode(payload).decode('utf-8')
-                    
-                    email_data["attachments"].append({
-                        "filename": filename,
-                        "content_type": content_type,
-                        "content": encoded_payload
-                    })
+                    if payload:
+                        encoded_payload = base64.b64encode(payload).decode('utf-8')
+                        
+                        email_data["attachments"].append({
+                            "filename": filename,
+                            "content_type": content_type,
+                            "content": encoded_payload
+                        })
         
         return email_data
 
@@ -128,11 +139,18 @@ class SMTPWebhookServer:
 
     async def start(self) -> None:
         """Start the SMTP server"""
+        # Create the SMTP controller with the webhook handler
         self.controller = Controller(
-            self.handler,
+            handler=self.handler,
             hostname=self.host,
-            port=self.port
+            port=self.port,
+            # Enable SMTP AUTH (though we'll accept any credentials)
+            auth_require_tls=False,
+            auth_required=False,
+            # Increase DATA size limit to 50MB
+            data_size_limit=50 * 1024 * 1024
         )
+        
         self.controller.start()
         logger.info(f"SMTP server started on {self.host}:{self.port}")
         
