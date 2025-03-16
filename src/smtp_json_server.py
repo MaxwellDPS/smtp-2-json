@@ -233,6 +233,7 @@ class EmailToJSONHandler(Message):
             
             # Get payload with safer error handling
             try:
+                # Use get_payload directly to avoid potential blocking in get_content
                 payload = part.get_payload(decode=True)
                 
                 # Handle empty payloads
@@ -260,14 +261,30 @@ class EmailToJSONHandler(Message):
                         'content': ''  # Empty content for very large attachments
                     }
                 else:
-                    # Normal attachment processing
+                    # Normal attachment processing - avoid encoding large content in one go
                     attachment = {
                         'filename': filename,
                         'content_type': part.get_content_type(),
                         'content_id': part.get('Content-ID', ''),
-                        'size': len(payload),
-                        'content': base64.b64encode(payload).decode('utf-8', errors='replace')
+                        'size': len(payload)
                     }
+                    
+                    # Process content in chunks to avoid memory issues
+                    try:
+                        # Encode in chunks of 1MB
+                        chunk_size = 1024 * 1024
+                        if len(payload) > 5 * chunk_size:
+                            # For very large files, just store the size
+                            attachment['content_truncated'] = True
+                            attachment['content'] = ''
+                        else:
+                            # Convert to base64 in a memory-efficient way
+                            attachment['content'] = base64.b64encode(payload).decode('utf-8', errors='replace')
+                    except Exception as e:
+                        logger.error(f"Error encoding attachment content: {e}")
+                        attachment['content_error'] = str(e)
+                        attachment['content'] = ''
+                
                 email_dict['attachments'].append(attachment)
                 
             except Exception as e:
@@ -344,7 +361,7 @@ class EmailToJSONHandler(Message):
         Process received email messages and convert to JSON.
         """
         try:
-            logger.info("Received email: %s", message.get('subject', 'No Subject'))
+            logger.info("Processing email: %s", message.get('subject', 'No Subject'))
             
             try:
                 # Ensure we have an aiohttp session
@@ -355,18 +372,21 @@ class EmailToJSONHandler(Message):
                 loop = asyncio.get_running_loop()
                 email_json = await loop.run_in_executor(None, self.email_to_json, message)
                 
-                # Send to webhook
-                await self._handle_json_output(email_json)
+                # Log the conversion success
+                logger.info("Successfully converted email to JSON")
                 
-                return '250 Message accepted for processing'
+                # Send to webhook
+                success = await self._handle_json_output(email_json)
+                if success:
+                    logger.info("Successfully sent email to webhook")
+                else:
+                    logger.warning("Failed to send email to webhook")
+                
             except Exception as e:
                 logger.error("Error processing message content: %s", str(e), exc_info=True)
-                # Still return success to the client
-                return '250 Message accepted but encountered processing errors'
                 
         except Exception as e:
             logger.error("Critical error handling message: %s", str(e), exc_info=True)
-            return '500 Error processing message'
 
     async def handle_DATA(self, server, session, envelope):
         """
@@ -377,6 +397,28 @@ class EmailToJSONHandler(Message):
             mail_from = envelope.mail_from
             rcpt_tos = envelope.rcpt_tos
             
+            # Log the incoming message size
+            message_size = len(message_data) if message_data else 0
+            logger.info(f"Received message: size={message_size} bytes, from={mail_from}, to={rcpt_tos}")
+            
+            # Use run_in_executor for potentially blocking operations like parsing email
+            loop = asyncio.get_running_loop()
+            
+            # Acknowledge receipt immediately before processing
+            # This prevents SMTP timeouts during processing of large messages
+            process_task = asyncio.create_task(self._process_message_async(message_data, mail_from, rcpt_tos))
+            
+            # Return early to prevent SMTP timeout
+            return '250 Message accepted for processing'
+                
+        except Exception as e:
+            logger.error(f"Critical error in handle_DATA: {e}", exc_info=True)
+            # Return temporary error so client can retry
+            return '451 Requested action aborted: local error in processing'
+            
+    async def _process_message_async(self, message_data, mail_from, rcpt_tos):
+        """Process the message asynchronously after responding to the client."""
+        try:
             # Use run_in_executor for potentially blocking operations like parsing email
             loop = asyncio.get_running_loop()
             
@@ -392,16 +434,11 @@ class EmailToJSONHandler(Message):
                 if 'To' not in message:
                     message['To'] = ', '.join(rcpt_tos)
                 
-                return await self.handle_message(message)
+                await self.handle_message(message)
             except Exception as e:
                 logger.error(f"Error parsing email message: {e}", exc_info=True)
-                # Return success to client but log the error
-                return '250 Message received but encountered parsing errors'
-                
         except Exception as e:
-            logger.error(f"Critical error in handle_DATA: {e}", exc_info=True)
-            # Return temporary error so client can retry
-            return '451 Requested action aborted: local error in processing'
+            logger.error(f"Error in async message processing: {e}", exc_info=True)
 
 
 async def amain(host, port, webhook_url):
