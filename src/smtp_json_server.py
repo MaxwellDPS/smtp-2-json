@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import sys
+import signal
 import argparse
 from datetime import datetime
 from email.policy import default
@@ -38,44 +39,58 @@ class CustomController(Controller):
     """
     Custom SMTP controller with enhanced error handling and proper async resource management.
     """
-    async def start(self):
-        """Start the controller using async."""
-        self.server = await self._create_server()
-        self.server_task = asyncio.create_task(self.server.serve_forever())
-        logger.info(f"SMTP server started on {self.hostname}:{self.port}")
-        
-    async def _create_server(self):
-        """Create and return the SMTP server."""
-        return await asyncio.start_server(
-            self.handler.handle_SMTP,
-            host=self.hostname,
-            port=self.port
-        )
+    def __init__(self, handler, hostname=None, port=None):
+        """Initialize the controller with proper async preparation."""
+        self._server_task = None
+        self._shutdown_event = asyncio.Event()
+        super().__init__(handler, hostname=hostname, port=port)
         
     async def stop_server(self):
         """Stop the server properly with async cleanup."""
         if self.server is not None:
+            # Signal the server to stop
+            self._shutdown_event.set()
+            
             # Close the server
             self.server.close()
+            
             # Wait for the server to close
-            await self.server.wait_closed()
-            if hasattr(self, 'server_task') and self.server_task:
+            if hasattr(self.server, 'wait_closed'):
+                await self.server.wait_closed()
+                
+            # Handle server task if it exists
+            if self._server_task:
                 try:
-                    self.server_task.cancel()
+                    # Give the task a chance to exit gracefully
                     try:
-                        await self.server_task
-                    except asyncio.CancelledError:
-                        pass
+                        await asyncio.wait_for(self._server_task, timeout=5.0)
+                    except asyncio.TimeoutError:
+                        self._server_task.cancel()
+                        try:
+                            await self._server_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
                 except Exception as e:
                     logger.error(f"Error canceling server task: {e}")
+                    
             self.server = None
-            self.server_task = None
+            self._server_task = None
             
-    async def stop(self):
-        """Properly stop the controller asynchronously."""
+    def stop(self):
+        """Properly stop the controller."""
         if self.server:
             logger.info("Stopping SMTP server...")
-            await self.stop_server()
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # Create a task to stop the server
+                asyncio.create_task(self.stop_server())
+            else:
+                # If no event loop is running, run the stop coroutine directly
+                loop.run_until_complete(self.stop_server())
+        self._thread_exception = None
+        if self._thread is not None:
+            self._thread.join()
+            self._thread = None
         logger.info("SMTP server stopped properly.")
 
 
@@ -405,12 +420,36 @@ async def amain(host, port, webhook_url):
             port=port
         )
         
-        # Start the server asynchronously
-        await controller.start()
+        # Start the server (using the standard Controller method)
+        controller.start()
+        logger.info(f"SMTP server started on {host}:{port}")
+        logger.info(f"Webhook URL configured: {webhook_url}")
         
-        # Keep the server running until interrupted
-        while True:
-            await asyncio.sleep(1)
+        # Create a cancellation event
+        shutdown_event = asyncio.Event()
+        
+        # Create a task to handle shutdown signals
+        def signal_handler():
+            logger.info("Shutdown signal received")
+            shutdown_event.set()
+            
+        # Register signal handlers for graceful shutdown
+        for signal_name in ('SIGINT', 'SIGTERM'):
+            try:
+                loop = asyncio.get_running_loop()
+                loop.add_signal_handler(
+                    getattr(signal, signal_name),
+                    signal_handler
+                )
+            except (NotImplementedError, ImportError):
+                # Signals might not be available on all platforms (e.g., Windows)
+                pass
+                
+        # Keep the server running until shutdown event is set
+        try:
+            await shutdown_event.wait()
+        except asyncio.CancelledError:
+            logger.info("Server task cancelled")
             
     except KeyboardInterrupt:
         logger.info("Server shutdown requested")
@@ -420,7 +459,7 @@ async def amain(host, port, webhook_url):
         # Cleanup
         try:
             if controller:
-                await controller.stop()
+                controller.stop()
         except Exception as e:
             logger.error(f"Error stopping controller: {e}", exc_info=True)
             
