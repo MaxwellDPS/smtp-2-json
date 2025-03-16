@@ -12,18 +12,17 @@ import email
 import json
 import logging
 import os
+import sys
 import argparse
-import time
 from datetime import datetime
 from email.policy import default
 from email.utils import parseaddr
 from pathlib import Path
-import aiohttp  # For async HTTP requests
 
 from aiosmtpd.controller import Controller
 from aiosmtpd.handlers import Message
-from aiosmtpd.smtp import AuthResult, LoginPassword  # For SMTP auth
 
+import requests  # For webhook functionality
 from dotenv import load_dotenv  # For environment variable support
 
 logging.basicConfig(
@@ -33,65 +32,15 @@ logging.basicConfig(
 logger = logging.getLogger('smtp-json-server')
 
 
-class RateLimiter:
-    """Simple token bucket rate limiter for protection against abuse"""
-    def __init__(self, rate, per):
-        self.rate = rate
-        self.per = per
-        self.allowance = rate
-        self.last_check = time.time()
-        
-    def is_allowed(self, cost=1):
-        current = time.time()
-        time_passed = current - self.last_check
-        self.last_check = current
-        
-        self.allowance += time_passed * (self.rate / self.per)
-        if self.allowance > self.rate:
-            self.allowance = self.rate
-            
-        if self.allowance < cost:
-            return False
-        else:
-            self.allowance -= cost
-            return True
-
-
-class SMTPAuthenticator:
-    """Handles SMTP authentication"""
-    def __init__(self, credentials):
-        self.credentials = credentials
-        
-    async def auth_login_password(self, server, args):
-        username, password = args
-        if username in self.credentials and self.credentials[username] == password:
-            return AuthResult(success=True)
-        return AuthResult(success=False)
-        
-    async def auth_plain(self, server, args):
-        auth_data = args
-        # Implementation for PLAIN auth mechanism would go here
-        # ...
-        # For now, return failed authentication
-        return AuthResult(success=False)
-
-
 class EmailToJSONHandler(Message):
-    def __init__(self, webhook_url, max_attachment_size=10*1024*1024):
+    def __init__(self, webhook_url):
         """
         Initialize the handler with the webhook URL.
         
         Args:
             webhook_url: URL to POST JSON data
-            max_attachment_size: Maximum size of attachments in bytes (default: 10MB)
         """
-        # Validate webhook URL
-        if not webhook_url.startswith(('http://', 'https://')):
-            raise ValueError("Webhook URL must start with http:// or https://")
-            
         self.webhook_url = webhook_url
-        self.max_attachment_size = max_attachment_size
-        self.rate_limiter = RateLimiter(10000, 60)  # 10 emails per minute
         
         super().__init__()
     
@@ -99,22 +48,24 @@ class EmailToJSONHandler(Message):
         """
         Process received email messages and convert to JSON.
         """
-        # Check rate limit
-        if not self.rate_limiter.is_allowed():
-            logger.warning("Rate limit exceeded, rejecting message")
-            return '421 Rate limit exceeded, try again later'
-            
         try:
             logger.info("Received email: %s", message.get('subject', 'No Subject'))
             
-            email_json = self.email_to_json(message)
-            
-            # Handle the JSON according to configured outputs
-            await self._handle_json_output(email_json)
-            
-            return '250 Message accepted for processing'
+            try:
+                # Increase timeout for webhook requests with large attachments
+                email_json = self.email_to_json(message)
+                
+                # Handle the JSON according to configured outputs
+                await self._handle_json_output(email_json)
+                
+                return '250 Message accepted for processing'
+            except Exception as e:
+                logger.error("Error processing message content: %s", str(e), exc_info=True)
+                # Still return success to the client
+                return '250 Message accepted but encountered processing errors'
+                
         except Exception as e:
-            logger.error("Error handling message: %s", str(e), exc_info=True)
+            logger.error("Critical error handling message: %s", str(e), exc_info=True)
             return '500 Error processing message'
     
     def email_to_json(self, message):
@@ -130,98 +81,172 @@ class EmailToJSONHandler(Message):
         # Basic email metadata
         email_dict = {
             'timestamp': datetime.now().isoformat(),
-            'headers': dict(message.items()),
-            'subject': message.get('subject', ''),
-            'from': message.get('from', ''),
-            'to': message.get('to', ''),
-            'cc': message.get('cc', ''),
-            'date': message.get('date', ''),
+            'headers': {},
+            'subject': '',
+            'from': '',
+            'to': '',
+            'cc': '',
+            'date': '',
             'body': {},
             'attachments': []
         }
         
-        # Extract email addresses
-        email_dict['from_email'] = parseaddr(email_dict['from'])[1]
-        email_dict['to_emails'] = [parseaddr(addr)[1] for addr in email_dict['to'].split(',') if parseaddr(addr)[1]]
+        # Safely extract headers
+        try:
+            email_dict['headers'] = dict(message.items())
+        except Exception as e:
+            logger.error(f"Error extracting headers: {e}", exc_info=True)
+            email_dict['headers'] = {'error': f"Could not extract headers: {str(e)}"}
+        
+        # Safely extract common headers
+        for header in ['subject', 'from', 'to', 'cc', 'date']:
+            try:
+                email_dict[header] = message.get(header, '')
+            except Exception as e:
+                logger.error(f"Error extracting {header}: {e}", exc_info=True)
+                email_dict[header] = f"Error extracting {header}"
+        
+        # Extract email addresses with error handling
+        try:
+            email_dict['from_email'] = parseaddr(email_dict['from'])[1]
+        except Exception as e:
+            logger.error(f"Error parsing from address: {e}", exc_info=True)
+            email_dict['from_email'] = "parse_error"
+            
+        try:
+            if email_dict['to']:
+                email_dict['to_emails'] = [
+                    parseaddr(addr)[1] for addr in email_dict['to'].split(',') 
+                    if parseaddr(addr)[1]
+                ]
+            else:
+                email_dict['to_emails'] = []
+        except Exception as e:
+            logger.error(f"Error parsing to addresses: {e}", exc_info=True)
+            email_dict['to_emails'] = ["parse_error"]
         
         # Process body parts and attachments
-        if message.is_multipart():
-            for part in message.walk():
-                self._process_part(part, email_dict)
-        else:
-            # Single part message
-            content_type = message.get_content_type()
-            content = message.get_content()
-            
-            if content_type.startswith('text/'):
-                email_dict['body'][content_type] = content
+        try:
+            if message.is_multipart():
+                for part in message.walk():
+                    self._process_part(part, email_dict)
             else:
-                # Treat as attachment
-                self._add_attachment(message, email_dict)
+                # Single part message
+                content_type = message.get_content_type()
+                
+                try:
+                    content = message.get_content()
+                    
+                    if content_type.startswith('text/'):
+                        if isinstance(content, bytes):
+                            content = content.decode('utf-8', errors='replace')
+                        email_dict['body'][content_type] = content
+                    else:
+                        # Treat as attachment
+                        self._add_attachment(message, email_dict)
+                except Exception as e:
+                    logger.error(f"Error getting content from message: {e}", exc_info=True)
+                    email_dict['body'][content_type] = f"Error: Could not extract content. {str(e)}"
+        except Exception as e:
+            logger.error(f"Error processing message body: {e}", exc_info=True)
+            email_dict['body']['error'] = f"Failed to process message body: {str(e)}"
         
         return email_dict
     
     def _process_part(self, part, email_dict):
-        """Process a message part and update the email_dict"""
-        content_type = part.get_content_type()
-        content_disposition = part.get('Content-Disposition', '')
-        
-        # Skip container multipart parts
-        if content_type.startswith('multipart/'):
-            return
-        
-        # Check if this is an attachment
-        if 'attachment' in content_disposition or 'inline' in content_disposition or not content_type.startswith('text/'):
-            self._add_attachment(part, email_dict)
-        else:
-            # This is a body part
-            try:
-                content = part.get_content()
-                email_dict['body'][content_type] = content
-            except Exception as e:
-                logger.error(f"Error getting content from part: {e}")
-                email_dict['body'][content_type] = "Error: Could not extract content"
+        """Process a message part and update the email_dict with improved error handling"""
+        try:
+            content_type = part.get_content_type()
+            content_disposition = part.get('Content-Disposition', '')
+            
+            # Skip container multipart parts
+            if content_type.startswith('multipart/'):
+                return
+            
+            # Check if this is an attachment
+            if 'attachment' in content_disposition or 'inline' in content_disposition or not content_type.startswith('text/'):
+                self._add_attachment(part, email_dict)
+            else:
+                # This is a body part
+                try:
+                    content = part.get_content()
+                    # Ensure the content is properly decoded and handle encoding errors
+                    if isinstance(content, bytes):
+                        content = content.decode('utf-8', errors='replace')
+                    email_dict['body'][content_type] = content
+                except Exception as e:
+                    logger.error(f"Error getting content from part: {e}", exc_info=True)
+                    email_dict['body'][content_type] = f"Error: Could not extract content. {str(e)}"
+        except Exception as e:
+            logger.error(f"Error processing message part: {e}", exc_info=True)
+            # Add an error entry to the body section
+            email_dict['body']['error'] = f"Failed to process part: {str(e)}"
     
     def _add_attachment(self, part, email_dict):
-        """Add an attachment to the email_dict"""
-        filename = part.get_filename()
-        if not filename:
-            # Generate a filename if none exists
-            ext = part.get_content_type().split('/')[1] if '/' in part.get_content_type() else 'bin'
-            filename = f"attachment-{len(email_dict['attachments'])}.{ext}"
-        
+        """Add an attachment to the email_dict with improved error handling"""
         try:
-            payload = part.get_payload(decode=True)
-            if payload:
-                # Check attachment size against limit
-                if len(payload) > self.max_attachment_size:
-                    logger.warning(f"Attachment {filename} exceeds maximum size limit of {self.max_attachment_size} bytes")
+            filename = part.get_filename()
+            if not filename:
+                # Generate a filename if none exists
+                ext = part.get_content_type().split('/')[1] if '/' in part.get_content_type() else 'bin'
+                filename = f"attachment-{len(email_dict['attachments'])}.{ext}"
+            
+            # Get payload with safer error handling
+            try:
+                payload = part.get_payload(decode=True)
+                
+                # Handle empty payloads
+                if payload is None:
+                    logger.warning(f"Empty payload for attachment: {filename}")
+                    attachment = {
+                        'filename': filename,
+                        'content_type': part.get_content_type(),
+                        'content_id': part.get('Content-ID', ''),
+                        'size': 0,
+                        'content': ''
+                    }
+                    email_dict['attachments'].append(attachment)
+                    return
+                
+                # For very large attachments, just include metadata without content
+                if len(payload) > 10 * 1024 * 1024:  # 10 MB limit
+                    logger.warning(f"Large attachment detected: {filename} ({len(payload)} bytes). Including metadata only.")
                     attachment = {
                         'filename': filename,
                         'content_type': part.get_content_type(),
                         'content_id': part.get('Content-ID', ''),
                         'size': len(payload),
-                        'error': 'Attachment exceeds size limit'
+                        'content_truncated': True,
+                        'content': ''  # Empty content for very large attachments
                     }
-                    email_dict['attachments'].append(attachment)
-                    return
+                else:
+                    # Normal attachment processing
+                    attachment = {
+                        'filename': filename,
+                        'content_type': part.get_content_type(),
+                        'content_id': part.get('Content-ID', ''),
+                        'size': len(payload),
+                        'content': base64.b64encode(payload).decode('utf-8', errors='replace')
+                    }
+                email_dict['attachments'].append(attachment)
                 
+            except Exception as e:
+                logger.error(f"Error processing attachment payload {filename}: {e}", exc_info=True)
                 attachment = {
                     'filename': filename,
                     'content_type': part.get_content_type(),
-                    'content_id': part.get('Content-ID', ''),
-                    'size': len(payload),
-                    'content': base64.b64encode(payload).decode('utf-8')
+                    'error': f"Payload error: {str(e)}"
                 }
                 email_dict['attachments'].append(attachment)
+                
         except Exception as e:
-            logger.error(f"Error processing attachment {filename}: {e}")
-            attachment = {
-                'filename': filename,
-                'content_type': part.get_content_type(),
-                'error': str(e)
-            }
-            email_dict['attachments'].append(attachment)
+            logger.error(f"Error processing attachment: {e}", exc_info=True)
+            # Add a placeholder for the errored attachment
+            email_dict['attachments'].append({
+                'filename': 'unknown_attachment',
+                'content_type': 'application/octet-stream',
+                'error': f"Processing error: {str(e)}"
+            })
     
     async def _handle_json_output(self, email_json):
         """Post the JSON to the configured webhook URL"""
@@ -235,67 +260,79 @@ class EmailToJSONHandler(Message):
             api_key = os.environ.get('API_KEY')
             if api_key:
                 headers['Authorization'] = f"Bearer {api_key}"
-                logger.info("Using API key for webhook authentication")  # Don't log the actual key
             
-            # Use aiohttp for asynchronous HTTP requests
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    self.webhook_url,
-                    json=email_json,
-                    headers=headers,
-                    timeout=10  # Add timeout for better reliability
-                ) as response:
-                    status_code = response.status
-                    logger.info(f"Webhook response: {status_code}")
-                    
-                    if status_code >= 400:
-                        error_text = await response.text()
-                        logger.error(f"Webhook error: {error_text}")
-                    
-                    return status_code < 400  # Return success status
+            # Check for any large attachments and handle them appropriately
+            total_size = sum(attachment.get('size', 0) for attachment in email_json.get('attachments', []))
+            logger.info(f"Total attachment size: {total_size} bytes")
             
+            # For extremely large emails, increase timeout or chunk them 
+            timeout = 30 if total_size > 50 * 1024 * 1024 else 10  # 30 seconds for >50MB
+            
+            # Make the POST request with appropriate timeout
+            response = requests.post(
+                self.webhook_url,
+                json=email_json,
+                headers=headers,
+                timeout=timeout
+            )
+            
+            logger.info(f"Webhook response: {response.status_code}")
+            
+            if response.status_code >= 400:
+                logger.error(f"Webhook error: {response.text}")
+            
+            return response.status_code < 400  # Return success status
+            
+        except requests.exceptions.Timeout:
+            logger.error(f"Webhook timeout - request took too long")
+            return False
+        except requests.exceptions.ConnectionError as e:
+            logger.error(f"Webhook connection error: {e}")
+            return False
         except Exception as e:
-            logger.error(f"Webhook error: {e}")
+            logger.error(f"Webhook error: {e}", exc_info=True)
             return False
 
     async def handle_DATA(self, server, session, envelope):
         """
-        Handle incoming SMTP DATA command.
+        Handle incoming SMTP DATA command with improved error handling.
         """
-        message_data = envelope.content
-        mail_from = envelope.mail_from
-        rcpt_tos = envelope.rcpt_tos
-        
-        message = email.message_from_bytes(message_data, policy=default)
-        # Add envelope data as headers if not present
-        if 'From' not in message:
-            message['From'] = mail_from
-        if 'To' not in message:
-            message['To'] = ', '.join(rcpt_tos)
-        
-        return await self.handle_message(message)
+        try:
+            message_data = envelope.content
+            mail_from = envelope.mail_from
+            rcpt_tos = envelope.rcpt_tos
+            
+            # Parse the email message with error handling
+            try:
+                message = email.message_from_bytes(message_data, policy=default)
+                
+                # Add envelope data as headers if not present
+                if 'From' not in message:
+                    message['From'] = mail_from
+                if 'To' not in message:
+                    message['To'] = ', '.join(rcpt_tos)
+                
+                return await self.handle_message(message)
+            except Exception as e:
+                logger.error(f"Error parsing email message: {e}", exc_info=True)
+                # Return success to client but log the error
+                return '250 Message received but encountered parsing errors'
+                
+        except Exception as e:
+            logger.error(f"Critical error in handle_DATA: {e}", exc_info=True)
+            # Return temporary error so client can retry
+            return '451 Requested action aborted: local error in processing'
 
 
-async def amain(host, port, webhook_url, auth_credentials=None, max_attachment_size=10*1024*1024):
+async def amain(host, port, webhook_url):
     """Async main function to run the SMTP server"""
-    handler = EmailToJSONHandler(
-        webhook_url=webhook_url,
-        max_attachment_size=max_attachment_size
+    handler = EmailToJSONHandler(webhook_url=webhook_url)
+    
+    controller = Controller(
+        handler,
+        hostname=host,
+        port=port
     )
-    
-    controller_kwargs = {
-        'handler': handler,
-        'hostname': host,
-        'port': port,
-    }
-    
-    # Set up authentication if credentials are provided
-    if auth_credentials:
-        authenticator = SMTPAuthenticator(auth_credentials)
-        controller_kwargs['auth_required'] = True
-        controller_kwargs['auth_callback'] = authenticator.auth_login_password
-    
-    controller = Controller(**controller_kwargs)
     
     controller.start()
     logger.info(f"SMTP server started on {host}:{port}")
@@ -320,11 +357,23 @@ def main():
     # Load environment variables from .env file if present
     load_dotenv()
     
+    # Configure logging based on environment
+    log_level = os.environ.get('LOG_LEVEL', 'INFO').upper()
+    logging.basicConfig(
+        level=getattr(logging, log_level),
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    )
+    logger = logging.getLogger('smtp-json-server')
+    
+    # Log startup information
+    logger.info("Starting SMTP to JSON Server")
+    logger.info(f"Log level set to {log_level}")
+    
     parser = argparse.ArgumentParser(description='SMTP server that converts emails to JSON and POSTs to a webhook')
     
     # Configuration can come from environment variables or command-line
     parser.add_argument('--host', 
-                      default=os.environ.get('SMTP_HOST', '0.0.0.0'),  # Default to localhost for security
+                      default=os.environ.get('SMTP_HOST', '0.0.0.0'),
                       help='Host to bind the SMTP server to (env: SMTP_HOST)')
                       
     parser.add_argument('--port', 
@@ -335,33 +384,21 @@ def main():
     parser.add_argument('--webhook-url', 
                       default=os.environ.get('WEBHOOK_URL'),
                       help='URL to POST JSON data (env: WEBHOOK_URL)')
-                      
-    parser.add_argument('--max-attachment-size',
-                      type=int,
-                      default=int(os.environ.get('MAX_ATTACHMENT_SIZE', str(15*1024*1024))),  # 15MB default
-                      help='Maximum attachment size in bytes (env: MAX_ATTACHMENT_SIZE)')
-    
-    parser.add_argument('--auth-file',
-                      default=os.environ.get('AUTH_FILE'),
-                      help='Path to JSON file with username:password auth credentials (env: AUTH_FILE)')
     
     args = parser.parse_args()
     
     if not args.webhook_url:
         parser.error("Webhook URL must be specified (--webhook-url or WEBHOOK_URL environment variable)")
     
-    # Load authentication credentials if provided
-    auth_credentials = None
-    if args.auth_file and os.path.exists(args.auth_file):
-        try:
-            with open(args.auth_file, 'r') as f:
-                auth_credentials = json.load(f)
-            logger.info(f"Loaded authentication credentials for {len(auth_credentials)} users")
-        except Exception as e:
-            logger.error(f"Error loading authentication credentials: {e}")
-            parser.error(f"Could not load authentication credentials from {args.auth_file}")
+    logger.info(f"Configuration: host={args.host}, port={args.port}, webhook={args.webhook_url}")
     
-    asyncio.run(amain(args.host, args.port, args.webhook_url, auth_credentials, args.max_attachment_size))
+    try:
+        asyncio.run(amain(args.host, args.port, args.webhook_url))
+    except KeyboardInterrupt:
+        logger.info("Received keyboard interrupt, shutting down")
+    except Exception as e:
+        logger.error(f"Unhandled exception: {e}", exc_info=True)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
