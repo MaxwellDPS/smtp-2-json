@@ -8,7 +8,7 @@ on:
     branches: [ main, master ]
 
 env:
-  DOCKER_HUB_REPO: your-dockerhub-username/smtp-json-server
+  DOCKER_HUB_REPO:  ${{ secrets.DOCKERHUB_USERNAME }}/smtp-json-server
   GHCR_REPO: ghcr.io/${{ github.repository }}
 
 jobs:
