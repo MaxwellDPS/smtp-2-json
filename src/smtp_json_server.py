@@ -4,12 +4,14 @@ import email
 import json
 import logging
 import os
+import smtpd
+import asyncore
+import threading
+import time
 from email.policy import default
-from typing import Dict, List, Any, Optional
-
-import aiohttp
-from aiosmtpd.controller import Controller
-from aiosmtpd.smtp import SMTP, Session, Envelope
+from http.client import HTTPConnection, HTTPSConnection
+from typing import Dict, Any
+from urllib.parse import urlparse
 
 # Configure logging
 logging.basicConfig(
@@ -18,43 +20,43 @@ logging.basicConfig(
 )
 logger = logging.getLogger('smtp-webhook')
 
-class WebhookHandler:
+class WebhookSMTPServer(smtpd.SMTPServer):
     """
-    SMTP Handler that forwards messages as JSON to a webhook URL
+    SMTP Server that forwards emails to a webhook
     """
-    def __init__(self, webhook_url: str):
+    def __init__(self, host, port, webhook_url):
+        super().__init__((host, port), None)
         self.webhook_url = webhook_url
         logger.info(f"Webhook URL configured: {webhook_url}")
-
-    async def handle_DATA(self, server, session, envelope):
-        """Process the email message and forward it to the webhook"""
+        
+    def process_message(self, peer, mailfrom, rcpttos, data, **kwargs):
+        """Process incoming message and forward to webhook"""
         try:
-            # Extract the message data
-            message_data = envelope.content
             # Parse the email message
-            message = email.message_from_bytes(message_data, policy=default)
+            message = email.message_from_bytes(data, policy=default)
             
             # Extract email data
-            email_data = await self._extract_email_data(message, envelope)
+            email_data = self._extract_email_data(message, mailfrom, rcpttos)
             
             # Send to webhook
-            await self._send_webhook(email_data)
+            self._send_webhook(email_data)
             
-            return '250 Message accepted for delivery'
+            logger.info(f"Processed message from {mailfrom} to {rcpttos}")
+            return None  # Indicate successful processing
         except Exception as e:
-            logger.error(f"Error handling message: {str(e)}", exc_info=True)
-            return '500 Error processing message'
+            logger.error(f"Error processing message: {str(e)}", exc_info=True)
+            return f"500 Error processing message: {str(e)}"
 
-    async def _extract_email_data(self, message, envelope) -> Dict[str, Any]:
+    def _extract_email_data(self, message, mailfrom, rcpttos) -> Dict[str, Any]:
         """Extract all relevant data from the email message"""
         # Get basic headers
         email_data = {
-            "from": envelope.mail_from,
-            "to": envelope.rcpt_tos,
+            "from": mailfrom,
+            "to": rcpttos,
             "subject": message.get("Subject", ""),
             "date": message.get("Date", ""),
             "message_id": message.get("Message-ID", ""),
-            "headers": dict(message.items()),
+            "headers": {k: v for k, v in message.items()},
             "body": {
                 "plain": "",
                 "html": ""
@@ -103,69 +105,53 @@ class WebhookHandler:
         
         return email_data
 
-    async def _send_webhook(self, email_data: Dict[str, Any]) -> None:
+    def _send_webhook(self, email_data: Dict[str, Any]) -> None:
         """Send the email data to the webhook URL"""
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    self.webhook_url,
-                    json=email_data,
-                    headers={"Content-Type": "application/json"}
-                ) as response:
-                    if response.status < 200 or response.status >= 300:
-                        response_text = await response.text()
-                        logger.error(f"Webhook responded with status {response.status}: {response_text}")
-                    else:
-                        logger.info(f"Webhook delivery successful: {response.status}")
+            # Parse the webhook URL
+            url = urlparse(self.webhook_url)
+            is_https = url.scheme == 'https'
+            
+            # Prepare the connection
+            if is_https:
+                conn = HTTPSConnection(url.netloc)
+            else:
+                conn = HTTPConnection(url.netloc)
+            
+            # Prepare the request body
+            body = json.dumps(email_data)
+            
+            # Send the request
+            path = url.path
+            if url.query:
+                path += '?' + url.query
+            
+            conn.request(
+                "POST", 
+                path, 
+                body=body, 
+                headers={
+                    "Content-Type": "application/json",
+                    "Content-Length": str(len(body))
+                }
+            )
+            
+            # Get the response
+            response = conn.getresponse()
+            status = response.status
+            
+            if status < 200 or status >= 300:
+                response_text = response.read().decode('utf-8')
+                logger.error(f"Webhook responded with status {status}: {response_text}")
+            else:
+                logger.info(f"Webhook delivery successful: {status}")
+            
+            conn.close()
         except Exception as e:
             logger.error(f"Failed to send webhook: {str(e)}", exc_info=True)
-            raise
 
-class SMTPWebhookServer:
-    """
-    SMTP server that forwards emails to a webhook
-    """
-    def __init__(
-        self, 
-        host: str, 
-        port: int, 
-        webhook_url: str
-    ):
-        self.host = host
-        self.port = port
-        self.webhook_url = webhook_url
-        self.handler = WebhookHandler(webhook_url)
-        self.controller = None
-
-    async def start(self) -> None:
-        """Start the SMTP server"""
-        # Create the SMTP controller with the webhook handler
-        self.controller = Controller(
-            handler=self.handler,
-            hostname=self.host,
-            port=self.port,
-            # Enable SMTP AUTH (though we'll accept any credentials)
-            auth_require_tls=False,
-            auth_required=False,
-            # Increase DATA size limit to 50MB
-            data_size_limit=50 * 1024 * 1024
-        )
-        
-        self.controller.start()
-        logger.info(f"SMTP server started on {self.host}:{self.port}")
-        
-        # Keep the server running
-        while True:
-            await asyncio.sleep(3600)  # Sleep for an hour
-    
-    def stop(self) -> None:
-        """Stop the SMTP server"""
-        if self.controller:
-            self.controller.stop()
-            logger.info("SMTP server stopped")
-
-async def main():
-    """Main entry point for the application"""
+def run_smtp_server():
+    """Run the SMTP server"""
     # Get configuration from environment variables
     smtp_host = os.environ.get('SMTP_HOST', '0.0.0.0')
     smtp_port = int(os.environ.get('SMTP_PORT', 25))
@@ -175,22 +161,17 @@ async def main():
         logger.error("WEBHOOK_URL environment variable is required")
         return
     
-    # Create and start the server
-    server = SMTPWebhookServer(
-        host=smtp_host,
-        port=smtp_port,
-        webhook_url=webhook_url
-    )
-    
     try:
         logger.info(f"Starting SMTP webhook forwarder on {smtp_host}:{smtp_port}")
-        await server.start()
+        server = WebhookSMTPServer(smtp_host, smtp_port, webhook_url)
+        
+        # Run asyncore loop in the main thread
+        asyncore.loop()
     except KeyboardInterrupt:
         logger.info("Server shutdown requested")
     except Exception as e:
         logger.error(f"Server error: {str(e)}", exc_info=True)
-    finally:
-        server.stop()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Run the server
+    run_smtp_server()
