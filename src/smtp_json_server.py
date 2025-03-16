@@ -1,32 +1,4 @@
-class CustomController(Controller):
-    """
-    Custom SMTP controller with enhanced error handling and proper async resource management.
-    """
-    async def stop_server(self):
-        """Stop the server properly with async cleanup."""
-        if self.server is not None:
-            # Close the server
-            self.server.close()
-            # Wait for the server to close
-            await self.server.wait_closed()
-            self.server = None
-            
-    def stop(self):
-        """Properly stop the controller."""
-        if self.server:
-            logger.info("Stopping SMTP server...")
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # Create a task to stop the server
-                asyncio.create_task(self.stop_server())
-            else:
-                # If no event loop is running, run the stop coroutine directly
-                loop.run_until_complete(self.stop_server())
-        self._thread_exception = None
-        if self._thread is not None:
-            self._thread.join()
-            self._thread = None
-        logger.info("SMTP server stopped properly.")"""
+"""
 SMTP to JSON Server
 
 This application acts as an SMTP server that receives emails,
@@ -67,6 +39,35 @@ logging.basicConfig(
 )
 logger = logging.getLogger('smtp-json-server')
 
+class CustomController(Controller):
+    """
+    Custom SMTP controller with enhanced error handling and proper async resource management.
+    """
+    async def stop_server(self):
+        """Stop the server properly with async cleanup."""
+        if self.server is not None:
+            # Close the server
+            self.server.close()
+            # Wait for the server to close
+            await self.server.wait_closed()
+            self.server = None
+            
+    def stop(self):
+        """Properly stop the controller."""
+        if self.server:
+            logger.info("Stopping SMTP server...")
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # Create a task to stop the server
+                asyncio.create_task(self.stop_server())
+            else:
+                # If no event loop is running, run the stop coroutine directly
+                loop.run_until_complete(self.stop_server())
+        self._thread_exception = None
+        if self._thread is not None:
+            self._thread.join()
+            self._thread = None
+        logger.info("SMTP server stopped properly.")
 
 class EmailToJSONHandler(Message):
     def __init__(self, webhook_url):
