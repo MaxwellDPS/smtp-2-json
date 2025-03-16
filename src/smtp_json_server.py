@@ -3,7 +3,7 @@ SMTP to JSON Server
 
 This application acts as an SMTP server that receives emails,
 converts them to JSON format (including attachments),
-and then outputs them or forwards them.
+and then posts them to a webhook URL.
 """
 
 import asyncio
@@ -14,7 +14,6 @@ import logging
 import os
 import sys
 import argparse
-import asyncio
 from datetime import datetime
 from email.policy import default
 from email.utils import parseaddr
@@ -24,20 +23,16 @@ from functools import partial
 from aiosmtpd.controller import Controller
 from aiosmtpd.handlers import Message
 
-import aiohttp  # Replacing requests with async HTTP client
+import aiohttp  # Async HTTP client
 from dotenv import load_dotenv  # For environment variable support
 
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
 )
 logger = logging.getLogger('smtp-json-server')
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-)
-logger = logging.getLogger('smtp-json-server')
 
 class CustomController(Controller):
     """
@@ -69,6 +64,7 @@ class CustomController(Controller):
             self._thread = None
         logger.info("SMTP server stopped properly.")
 
+
 class EmailToJSONHandler(Message):
     def __init__(self, webhook_url):
         """
@@ -81,35 +77,6 @@ class EmailToJSONHandler(Message):
         self.session = None  # Will initialize in handle_message
         
         super().__init__()
-    
-    async def handle_message(self, message):
-        """
-        Process received email messages and convert to JSON.
-        """
-        try:
-            logger.info("Received email: %s", message.get('subject', 'No Subject'))
-            
-            try:
-                # Ensure we have an aiohttp session
-                if self.session is None or self.session.closed:
-                    self.session = aiohttp.ClientSession()
-                
-                # Run email_to_json in a thread pool to avoid blocking the event loop
-                loop = asyncio.get_event_loop()
-                email_json = await loop.run_in_executor(None, self.email_to_json, message)
-                
-                # Send to webhook
-                await self._handle_json_output(email_json)
-                
-                return '250 Message accepted for processing'
-            except Exception as e:
-                logger.error("Error processing message content: %s", str(e), exc_info=True)
-                # Still return success to the client
-                return '250 Message accepted but encountered processing errors'
-                
-        except Exception as e:
-            logger.error("Critical error handling message: %s", str(e), exc_info=True)
-            return '500 Error processing message'
     
     def email_to_json(self, message):
         """
@@ -342,6 +309,35 @@ class EmailToJSONHandler(Message):
         except Exception as e:
             logger.error(f"Webhook error: {e}", exc_info=True)
             return False
+    
+    async def handle_message(self, message):
+        """
+        Process received email messages and convert to JSON.
+        """
+        try:
+            logger.info("Received email: %s", message.get('subject', 'No Subject'))
+            
+            try:
+                # Ensure we have an aiohttp session
+                if self.session is None or self.session.closed:
+                    self.session = aiohttp.ClientSession()
+                
+                # Run email_to_json in a thread pool to avoid blocking the event loop
+                loop = asyncio.get_event_loop()
+                email_json = await loop.run_in_executor(None, self.email_to_json, message)
+                
+                # Send to webhook
+                await self._handle_json_output(email_json)
+                
+                return '250 Message accepted for processing'
+            except Exception as e:
+                logger.error("Error processing message content: %s", str(e), exc_info=True)
+                # Still return success to the client
+                return '250 Message accepted but encountered processing errors'
+                
+        except Exception as e:
+            logger.error("Critical error handling message: %s", str(e), exc_info=True)
+            return '500 Error processing message'
 
     async def handle_DATA(self, server, session, envelope):
         """
