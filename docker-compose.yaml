@@ -5,13 +5,16 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: smtp-json-server:latest
+    # Uncomment and modify this line to use your Docker Hub image
+    # image: your-dockerhub-username/smtp-json-server:latest
     container_name: smtp-json-server
     ports:
       - "8025:8025"
-    volumes:
-      - ./emails:/app/emails
     environment:
+      - SMTP_HOST=0.0.0.0
+      - SMTP_PORT=8025
+      - WEBHOOK_URL=https://your-webhook-endpoint.com/api/emails
+      - API_KEY=your_api_key_here
+      - LOG_LEVEL=INFO
       - TZ=UTC
     restart: unless-stopped
-    command: ["--host", "0.0.0.0", "--port", "8025", "--output-dir", "/app/emails", "--stdout"]
