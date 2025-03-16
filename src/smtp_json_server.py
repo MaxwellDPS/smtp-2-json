@@ -38,6 +38,20 @@ class CustomController(Controller):
     """
     Custom SMTP controller with enhanced error handling and proper async resource management.
     """
+    async def start(self):
+        """Start the controller using async."""
+        self.server = await self._create_server()
+        self.server_task = asyncio.create_task(self.server.serve_forever())
+        logger.info(f"SMTP server started on {self.hostname}:{self.port}")
+        
+    async def _create_server(self):
+        """Create and return the SMTP server."""
+        return await asyncio.start_server(
+            self.handler.handle_SMTP,
+            host=self.hostname,
+            port=self.port
+        )
+        
     async def stop_server(self):
         """Stop the server properly with async cleanup."""
         if self.server is not None:
@@ -45,23 +59,23 @@ class CustomController(Controller):
             self.server.close()
             # Wait for the server to close
             await self.server.wait_closed()
+            if hasattr(self, 'server_task') and self.server_task:
+                try:
+                    self.server_task.cancel()
+                    try:
+                        await self.server_task
+                    except asyncio.CancelledError:
+                        pass
+                except Exception as e:
+                    logger.error(f"Error canceling server task: {e}")
             self.server = None
+            self.server_task = None
             
-    def stop(self):
-        """Properly stop the controller."""
+    async def stop(self):
+        """Properly stop the controller asynchronously."""
         if self.server:
             logger.info("Stopping SMTP server...")
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # Create a task to stop the server
-                asyncio.create_task(self.stop_server())
-            else:
-                # If no event loop is running, run the stop coroutine directly
-                loop.run_until_complete(self.stop_server())
-        self._thread_exception = None
-        if self._thread is not None:
-            self._thread.join()
-            self._thread = None
+            await self.stop_server()
         logger.info("SMTP server stopped properly.")
 
 
@@ -323,7 +337,7 @@ class EmailToJSONHandler(Message):
                     self.session = aiohttp.ClientSession()
                 
                 # Run email_to_json in a thread pool to avoid blocking the event loop
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 email_json = await loop.run_in_executor(None, self.email_to_json, message)
                 
                 # Send to webhook
@@ -349,7 +363,7 @@ class EmailToJSONHandler(Message):
             rcpt_tos = envelope.rcpt_tos
             
             # Use run_in_executor for potentially blocking operations like parsing email
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             
             # Parse the email message with error handling
             try:
@@ -391,11 +405,10 @@ async def amain(host, port, webhook_url):
             port=port
         )
         
-        controller.start()
-        logger.info(f"SMTP server started on {host}:{port}")
-        logger.info(f"Webhook URL configured: {webhook_url}")
+        # Start the server asynchronously
+        await controller.start()
         
-        # Keep the server running
+        # Keep the server running until interrupted
         while True:
             await asyncio.sleep(1)
             
@@ -407,12 +420,12 @@ async def amain(host, port, webhook_url):
         # Cleanup
         try:
             if controller:
-                controller.stop()
+                await controller.stop()
         except Exception as e:
             logger.error(f"Error stopping controller: {e}", exc_info=True)
             
         # Close the aiohttp session
-        if not session.closed:
+        if session and not session.closed:
             await session.close()
             
         logger.info("SMTP server stopped")
