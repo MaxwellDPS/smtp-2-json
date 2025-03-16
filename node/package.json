@@ -1,0 +1,24 @@
+{
+  "name": "smtp-webhook-forwarder",
+  "version": "1.0.0",
+  "description": "SMTP server that forwards emails to a webhook as JSON",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "smtp",
+    "webhook",
+    "email",
+    "forwarder"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.6.0",
+    "dotenv": "^16.3.1",
+    "mailparser": "^3.6.5",
+    "smtp-server": "^3.13.0"
+  }
+}
