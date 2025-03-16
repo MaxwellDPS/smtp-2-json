@@ -1,4 +1,32 @@
-"""
+class CustomController(Controller):
+    """
+    Custom SMTP controller with enhanced error handling and proper async resource management.
+    """
+    async def stop_server(self):
+        """Stop the server properly with async cleanup."""
+        if self.server is not None:
+            # Close the server
+            self.server.close()
+            # Wait for the server to close
+            await self.server.wait_closed()
+            self.server = None
+            
+    def stop(self):
+        """Properly stop the controller."""
+        if self.server:
+            logger.info("Stopping SMTP server...")
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # Create a task to stop the server
+                asyncio.create_task(self.stop_server())
+            else:
+                # If no event loop is running, run the stop coroutine directly
+                loop.run_until_complete(self.stop_server())
+        self._thread_exception = None
+        if self._thread is not None:
+            self._thread.join()
+            self._thread = None
+        logger.info("SMTP server stopped properly.")"""
 SMTP to JSON Server
 
 This application acts as an SMTP server that receives emails,
@@ -14,16 +42,24 @@ import logging
 import os
 import sys
 import argparse
+import asyncio
 from datetime import datetime
 from email.policy import default
 from email.utils import parseaddr
 from pathlib import Path
+from functools import partial
 
 from aiosmtpd.controller import Controller
 from aiosmtpd.handlers import Message
 
 import aiohttp  # Replacing requests with async HTTP client
 from dotenv import load_dotenv  # For environment variable support
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+)
+logger = logging.getLogger('smtp-json-server')
 
 logging.basicConfig(
     level=logging.INFO,
@@ -57,8 +93,9 @@ class EmailToJSONHandler(Message):
                 if self.session is None or self.session.closed:
                     self.session = aiohttp.ClientSession()
                 
-                # Convert email to JSON
-                email_json = self.email_to_json(message)
+                # Run email_to_json in a thread pool to avoid blocking the event loop
+                loop = asyncio.get_event_loop()
+                email_json = await loop.run_in_executor(None, self.email_to_json, message)
                 
                 # Send to webhook
                 await self._handle_json_output(email_json)
@@ -76,6 +113,7 @@ class EmailToJSONHandler(Message):
     def email_to_json(self, message):
         """
         Convert email.message.Message to JSON-serializable dict.
+        This is a synchronous method as message parsing doesn't need to be async.
         
         Args:
             message: email.message.Message object
@@ -306,16 +344,21 @@ class EmailToJSONHandler(Message):
 
     async def handle_DATA(self, server, session, envelope):
         """
-        Handle incoming SMTP DATA command with improved error handling.
+        Handle incoming SMTP DATA command with proper async handling.
         """
         try:
             message_data = envelope.content
             mail_from = envelope.mail_from
             rcpt_tos = envelope.rcpt_tos
             
+            # Use run_in_executor for potentially blocking operations like parsing email
+            loop = asyncio.get_event_loop()
+            
             # Parse the email message with error handling
             try:
-                message = email.message_from_bytes(message_data, policy=default)
+                # Run the message parsing in a separate thread to avoid blocking
+                parse_func = partial(email.message_from_bytes, message_data, policy=default)
+                message = await loop.run_in_executor(None, parse_func)
                 
                 # Add envelope data as headers if not present
                 if 'From' not in message:
@@ -337,31 +380,43 @@ class EmailToJSONHandler(Message):
 
 async def amain(host, port, webhook_url):
     """Async main function to run the SMTP server"""
-    handler = EmailToJSONHandler(webhook_url=webhook_url)
-    
-    controller = Controller(
-        handler,
-        hostname=host,
-        port=port
-    )
-    
-    controller.start()
-    logger.info(f"SMTP server started on {host}:{port}")
-    logger.info(f"Webhook URL configured: {webhook_url}")
+    # Create a shared aiohttp session for the handler to use
+    session = aiohttp.ClientSession()
+    controller = None
     
     try:
+        handler = EmailToJSONHandler(webhook_url=webhook_url)
+        handler.session = session  # Use the shared session
+        
+        controller = CustomController(
+            handler,
+            hostname=host,
+            port=port
+        )
+        
+        controller.start()
+        logger.info(f"SMTP server started on {host}:{port}")
+        logger.info(f"Webhook URL configured: {webhook_url}")
+        
         # Keep the server running
         while True:
             await asyncio.sleep(1)
+            
     except KeyboardInterrupt:
         logger.info("Server shutdown requested")
+    except Exception as e:
+        logger.error(f"Server error: {e}", exc_info=True)
     finally:
         # Cleanup
-        controller.stop()
-        
-        # Close the aiohttp session if it exists
-        if hasattr(handler, 'session') and handler.session and not handler.session.closed:
-            await handler.session.close()
+        try:
+            if controller:
+                controller.stop()
+        except Exception as e:
+            logger.error(f"Error stopping controller: {e}", exc_info=True)
+            
+        # Close the aiohttp session
+        if not session.closed:
+            await session.close()
             
         logger.info("SMTP server stopped")
 
